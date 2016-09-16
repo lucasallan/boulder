@@ -60,22 +60,6 @@ func NewSQLStorageAuthority(dbMap *gorp.DbMap, clk clock.Clock, logger blog.Logg
 	return ssa, nil
 }
 
-func statusIsPending(status core.AcmeStatus) bool {
-	return status == core.StatusPending || status == core.StatusProcessing || status == core.StatusUnknown
-}
-
-func existingPending(tx *gorp.Transaction, id string) bool {
-	var count int64
-	_ = tx.SelectOne(&count, "SELECT count(*) FROM pendingAuthorizations WHERE id = :id", map[string]interface{}{"id": id})
-	return count > 0
-}
-
-func existingFinal(tx *gorp.Transaction, id string) bool {
-	var count int64
-	_ = tx.SelectOne(&count, "SELECT count(*) FROM authz WHERE id = :id", map[string]interface{}{"id": id})
-	return count > 0
-}
-
 func existingRegistration(tx *gorp.Transaction, id int64) bool {
 	var count int64
 	_ = tx.SelectOne(&count, "SELECT count(*) FROM registrations WHERE id = :id", map[string]interface{}{"id": id})
@@ -538,6 +522,8 @@ func (ssa *SQLStorageAuthority) NewPendingAuthorization(ctx context.Context, aut
 		return
 	}
 
+	authz.Status = core.StatusPending
+
 	// Check that it doesn't exist already
 	authz.ID = core.NewToken()
 	for existingPending(tx, authz.ID) || existingFinal(tx, authz.ID) {
@@ -545,9 +531,10 @@ func (ssa *SQLStorageAuthority) NewPendingAuthorization(ctx context.Context, aut
 	}
 
 	// Insert a stub row in pending
-	pendingAuthz := pendingauthzModel{Authorization: authz}
+	pendingAuthz := authzModel{Authorization: authz}
 	err = tx.Insert(&pendingAuthz)
 	if err != nil {
+		fmt.Printf("Err: %#v\n", err)
 		err = Rollback(tx, err)
 		return
 	}
@@ -607,23 +594,56 @@ func (ssa *SQLStorageAuthority) UpdatePendingAuthorization(ctx context.Context, 
 		return
 	}
 
+	// First try to get a row from `pendingAuthorizations` as
+	// a `pendingauthzModel`
 	authObj, err := tx.Get(pendingauthzModel{}, authz.ID)
 	if err != nil {
 		err = Rollback(tx, err)
 		return
 	}
-	auth := authObj.(*pendingauthzModel)
-	auth.Authorization = authz
-	_, err = tx.Update(auth)
-	if err != nil {
-		err = Rollback(tx, err)
-		return
-	}
-
-	err = updateChallenges(authz.ID, authz.Challenges, tx)
-	if err != nil {
-		err = Rollback(tx, err)
-		return
+	if authObj != nil {
+		// If we found one, great, assign the Authorization after a cast and perform
+		// the update
+		authD := *authObj.(*pendingauthzModel)
+		authD.Authorization = authz
+		_, err = tx.Update(authD)
+		if err != nil {
+			err = Rollback(tx, err)
+			return
+		}
+		err = updateChallenges(authz.ID, authz.Challenges, tx)
+		if err != nil {
+			err = Rollback(tx, err)
+			return
+		}
+	} else {
+		// Otherwise, try to find a `authz` row as a `authzModel`
+		authObj, err = tx.Get(authzModel{}, authz.ID)
+		if err != nil {
+			err = Rollback(tx, err)
+			return
+		}
+		if authObj == nil {
+			err = fmt.Errorf("No pendingAuthorization or authz with ID %s", authz.ID)
+			err = Rollback(tx, err)
+			return
+		}
+		// With a row in hand, we can cast & assign the Authorization, and perform
+		// the update
+		authD := authObj.(*authzModel)
+		authz = authD.Authorization
+		_, err = tx.Update(authD)
+		if err != nil {
+			err = Rollback(tx, err)
+			return
+		}
+		fmt.Printf("authz: %#v\n", authz)
+		fmt.Printf("chals: %#v\n", authz.Challenges)
+		err = updateChallenges(authz.ID, authz.Challenges, tx)
+		if err != nil {
+			err = Rollback(tx, err)
+			return
+		}
 	}
 
 	err = tx.Commit()
@@ -649,24 +669,56 @@ func (ssa *SQLStorageAuthority) FinalizeAuthorization(ctx context.Context, authz
 		return
 	}
 
-	auth := &authzModel{authz}
+	// First try to get a row from `pendingAuthorizations` as
+	// a `pendingauthzModel`
 	authObj, err := tx.Get(pendingauthzModel{}, authz.ID)
 	if err != nil {
 		err = Rollback(tx, err)
 		return
 	}
-	oldAuth := authObj.(*pendingauthzModel)
+	if authObj != nil {
+		// If we found one, follow the legacy finalization process: insert a new
+		// `authz` row, delete the old `pendingAuthorizations` row
+		oldAuth := *authObj.(*pendingauthzModel)
+		auth := &authzModel{authz}
 
-	err = tx.Insert(auth)
-	if err != nil {
-		err = Rollback(tx, err)
-		return
-	}
+		err = tx.Insert(auth)
+		if err != nil {
+			err = Rollback(tx, err)
+			return
+		}
 
-	_, err = tx.Delete(oldAuth)
-	if err != nil {
-		err = Rollback(tx, err)
-		return
+		_, err = tx.Delete(oldAuth)
+		if err != nil {
+			err = Rollback(tx, err)
+			return
+		}
+
+	} else {
+		// Otherwise, try to find a `authz` row as a `authzModel`
+		authObj, err = tx.Get(authzModel{}, authz.ID)
+		if err != nil {
+			err = Rollback(tx, err)
+			return
+		}
+		if authObj == nil {
+			notFound := fmt.Errorf("No pendingAuthorization or authz with ID %s", authz.ID)
+			err = Rollback(tx, notFound)
+			return
+		}
+
+		// With a pending row in the `authz` table we need to UPDATE the row rather
+		// than deleting a pending row and inserting a `authz` row
+		// the update
+		oldAuth := authObj.(*authzModel)
+
+		oldAuth.Authorization = authz
+		_, err = tx.Update(oldAuth)
+		if err != nil {
+			err = Rollback(tx, err)
+			return
+		}
+
 	}
 
 	err = updateChallenges(authz.ID, authz.Challenges, tx)
@@ -690,7 +742,7 @@ func (ssa *SQLStorageAuthority) RevokeAuthorizationsByDomain(ctx context.Context
 	results := []int64{0, 0}
 
 	now := ssa.clk.Now()
-	for i, table := range []string{"authz", "pendingAuthorizations"} {
+	for i, table := range authorizationTables {
 		for {
 			authz, err := getAuthorizationIDsByDomain(ssa.dbMap, table, identifier, now)
 			if err != nil {
@@ -802,16 +854,33 @@ func (ssa *SQLStorageAuthority) CountCertificatesRange(ctx context.Context, star
 
 // CountPendingAuthorizations returns the number of pending, unexpired
 // authorizations for the give registration.
-func (ssa *SQLStorageAuthority) CountPendingAuthorizations(ctx context.Context, regID int64) (count int, err error) {
-	err = ssa.dbMap.SelectOne(&count,
-		`SELECT count(1) FROM pendingAuthorizations
-		 WHERE registrationID = :regID AND
-				expires > :now`,
-		map[string]interface{}{
-			"regID": regID,
-			"now":   ssa.clk.Now(),
-		})
-	return
+func (ssa *SQLStorageAuthority) CountPendingAuthorizations(ctx context.Context, regID int64) (int, error) {
+	var count int64
+
+	for _, table := range authorizationTables {
+		stmtArgs := []interface{}{regID, ssa.clk.Now()}
+		qmarks := []string{}
+		for _, status := range pendingStatuses {
+			stmtArgs = append(stmtArgs, string(status))
+			qmarks = append(qmarks, "?")
+		}
+		statusStmt := fmt.Sprintf("(%s)", strings.Join(qmarks, ","))
+
+		var tableCount int64
+		err := ssa.dbMap.SelectOne(&tableCount, fmt.Sprintf(`
+		SELECT COUNT(1) FROM %s
+		WHERE registrationID = ?
+		AND expires > ?
+		AND status IN %s`, table, statusStmt),
+			stmtArgs...)
+		if err != nil {
+			fmt.Printf("Non nil err!!! %#v\n", err)
+			return int(count), nil
+		}
+		count += tableCount
+	}
+
+	return int(count), nil
 }
 
 // ErrNoReceipt is an error type for non-existent SCT receipt
