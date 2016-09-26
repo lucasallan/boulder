@@ -522,8 +522,6 @@ func (ssa *SQLStorageAuthority) NewPendingAuthorization(ctx context.Context, aut
 		return
 	}
 
-	authz.Status = core.StatusPending
-
 	// Check that it doesn't exist already
 	authz.ID = core.NewToken()
 	for existingPending(tx, authz.ID) || existingFinal(tx, authz.ID) {
@@ -534,7 +532,6 @@ func (ssa *SQLStorageAuthority) NewPendingAuthorization(ctx context.Context, aut
 	pendingAuthz := authzModel{Authorization: authz}
 	err = tx.Insert(&pendingAuthz)
 	if err != nil {
-		fmt.Printf("Err: %#v\n", err)
 		err = Rollback(tx, err)
 		return
 	}
@@ -624,21 +621,18 @@ func (ssa *SQLStorageAuthority) UpdatePendingAuthorization(ctx context.Context, 
 			return
 		}
 		if authObj == nil {
-			err = fmt.Errorf("No pendingAuthorization or authz with ID %s", authz.ID)
 			err = Rollback(tx, err)
 			return
 		}
 		// With a row in hand, we can cast & assign the Authorization, and perform
 		// the update
 		authD := authObj.(*authzModel)
-		authz = authD.Authorization
+		authD.Authorization = authz
 		_, err = tx.Update(authD)
 		if err != nil {
 			err = Rollback(tx, err)
 			return
 		}
-		fmt.Printf("authz: %#v\n", authz)
-		fmt.Printf("chals: %#v\n", authz.Challenges)
 		err = updateChallenges(authz.ID, authz.Challenges, tx)
 		if err != nil {
 			err = Rollback(tx, err)
@@ -658,7 +652,7 @@ func (ssa *SQLStorageAuthority) FinalizeAuthorization(ctx context.Context, authz
 	}
 
 	// Check that a pending authz exists
-	if !existingPending(tx, authz.ID) {
+	if !existingPending(tx, authz.ID) && !existingFinal(tx, authz.ID) {
 		err = errors.New("Cannot finalize an authorization that is not pending")
 		err = Rollback(tx, err)
 		return
