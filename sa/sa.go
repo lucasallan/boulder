@@ -130,34 +130,38 @@ func (ssa *SQLStorageAuthority) GetRegistrationByKey(ctx context.Context, key jo
 	return modelToRegistration(reg)
 }
 
-// GetAuthorization obtains an Authorization by ID
-func (ssa *SQLStorageAuthority) GetAuthorization(ctx context.Context, id string) (authz core.Authorization, err error) {
+func (ssa *SQLStorageAuthority) getAuthz(ctx context.Context, id string) (core.Authorization, string, error) {
+	var authz core.Authorization
+	var table string
+
 	tx, err := ssa.dbMap.Begin()
 	if err != nil {
-		return
+		return authz, table, err
 	}
 
 	authObj, err := tx.Get(pendingauthzModel{}, id)
 	if err != nil {
 		err = Rollback(tx, err)
-		return
+		return authz, table, err
 	}
 	if authObj != nil {
 		authD := *authObj.(*pendingauthzModel)
 		authz = authD.Authorization
+		table = "pendingAuthorizations"
 	} else {
 		authObj, err = tx.Get(authzModel{}, id)
 		if err != nil {
 			err = Rollback(tx, err)
-			return
+			return authz, table, err
 		}
 		if authObj == nil {
 			err = fmt.Errorf("No pendingAuthorization or authz with ID %s", id)
 			err = Rollback(tx, err)
-			return
+			return authz, table, err
 		}
 		authD := authObj.(*authzModel)
 		authz = authD.Authorization
+		table = "authz"
 	}
 
 	var challObjs []challModel
@@ -168,21 +172,27 @@ func (ssa *SQLStorageAuthority) GetAuthorization(ctx context.Context, id string)
 	)
 	if err != nil {
 		err = Rollback(tx, err)
-		return
+		return authz, table, err
 	}
 	var challs []core.Challenge
 	for _, c := range challObjs {
 		chall, err := modelToChallenge(&c)
 		if err != nil {
 			err = Rollback(tx, err)
-			return core.Authorization{}, err
+			return authz, table, err
 		}
 		challs = append(challs, chall)
 	}
 	authz.Challenges = challs
 
 	err = tx.Commit()
-	return
+	return authz, table, nil
+}
+
+// GetAuthorization obtains an Authorization by ID
+func (ssa *SQLStorageAuthority) GetAuthorization(ctx context.Context, id string) (core.Authorization, error) {
+	authz, _, err := ssa.getAuthz(ctx, id)
+	return authz, err
 }
 
 // GetValidAuthorizations returns the latest authorization object for all
@@ -528,7 +538,11 @@ func (ssa *SQLStorageAuthority) NewPendingAuthorization(ctx context.Context, aut
 		authz.ID = core.NewToken()
 	}
 
-	// Insert a stub row in pending
+	if authz.Status == "" {
+		authz.Status = core.StatusPending
+	}
+
+	// Insert a stub row in authz
 	pendingAuthz := authzModel{Authorization: authz}
 	err = tx.Insert(&pendingAuthz)
 	if err != nil {
@@ -868,7 +882,6 @@ func (ssa *SQLStorageAuthority) CountPendingAuthorizations(ctx context.Context, 
 		AND status IN %s`, table, statusStmt),
 			stmtArgs...)
 		if err != nil {
-			fmt.Printf("Non nil err!!! %#v\n", err)
 			return int(count), nil
 		}
 		count += tableCount
@@ -986,19 +999,19 @@ func (ssa *SQLStorageAuthority) DeactivateAuthorization(ctx context.Context, id 
 	if err != nil {
 		return err
 	}
-	table := "authz"
-	oldStatus := core.StatusValid
-	if existingPending(tx, id) {
-		table = "pendingAuthorizations"
-		oldStatus = core.StatusPending
+
+	authz, table, err := ssa.getAuthz(ctx, id)
+	if err != nil {
+		return err
+	}
+
+	if authz.Status != core.StatusPending && authz.Status != core.StatusValid {
+		return nil // old behaviour - skip
 	}
 
 	_, err = tx.Exec(
-		fmt.Sprintf(`UPDATE %s SET status = ? WHERE id = ? and status = ?`, table),
-		string(core.StatusDeactivated),
-		id,
-		string(oldStatus),
-	)
+		fmt.Sprintf(`UPDATE %s SET status = ? WHERE id = ? and status IN (?, ?)`, table),
+		string(core.StatusDeactivated), id, string(core.StatusPending), string(core.StatusValid))
 	if err != nil {
 		err = Rollback(tx, err)
 		return err
